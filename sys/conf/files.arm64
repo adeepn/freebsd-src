@@ -579,6 +579,8 @@ dev/clk/meson/meson_clk_gxbb.c			optional soc_amlogic_s905x meson_clk fdt
 dev/clk/meson/meson_reset.c			optional soc_amlogic_s905x fdt
 # Amlogic Meson pinctrl/GPIO
 arm/amlogic/meson_pinctrl.c			optional gpio soc_amlogic_s905x fdt
+# Amlogic Meson MMC host controller
+dev/mmc/host/meson_mmc.c			optional mmc soc_amlogic_s905x fdt
 
 # Allwinner padconf files
 arm/allwinner/a64/a64_padconf.c			optional soc_allwinner_a64 fdt
