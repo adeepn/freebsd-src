@@ -26,6 +26,7 @@ include		"std.dev"
 # Include SoC specific configuration
 include		"std.al"
 include		"std.allwinner"
+include		"std.amlogic"
 include		"std.altera"
 include		"std.amd"
 include		"std.apple"
