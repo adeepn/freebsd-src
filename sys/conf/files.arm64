@@ -575,6 +575,8 @@ dev/clk/allwinner/ccu_de2.c			optional aw_ccu fdt
 # Amlogic Meson clock driver
 dev/clk/meson/meson_clk.c			optional meson_clk fdt
 dev/clk/meson/meson_clk_gxbb.c			optional soc_amlogic_s905x meson_clk fdt
+# Amlogic Meson reset controller
+dev/clk/meson/meson_reset.c			optional soc_amlogic_s905x fdt
 
 # Allwinner padconf files
 arm/allwinner/a64/a64_padconf.c			optional soc_allwinner_a64 fdt
