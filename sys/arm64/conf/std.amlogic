@@ -5,6 +5,9 @@
 # SoC support
 options 	SOC_AMLOGIC_S905X
 
+# Clock and reset controllers
+device		meson_clk		# Amlogic Meson clock controller
+
 # Serial (COM) ports
 device		uart_meson		# Amlogic Meson UART
 
