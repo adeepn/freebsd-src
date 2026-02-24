@@ -364,7 +364,8 @@ meson_pinctrl_attach(device_t dev)
 		return (ENXIO);
 	}
 
-	return (bus_attach_children(dev));
+	bus_attach_children(dev);
+	return (0);
 }
 
 static int

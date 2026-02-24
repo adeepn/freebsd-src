@@ -919,6 +919,4 @@ static driver_t meson_mmc_driver = {
 };
 
 DRIVER_MODULE(meson_mmc, simplebus, meson_mmc_driver, NULL, NULL);
-DRIVER_MODULE(mmc, meson_mmc, mmc_driver, NULL, NULL);
-MODULE_DEPEND(meson_mmc, mmc, 1, 1, 1);
 MMC_DECLARE_BRIDGE(meson_mmc);
