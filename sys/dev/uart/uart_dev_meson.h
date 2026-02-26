@@ -59,7 +59,7 @@
 #define	AML_UART_TX_RST		(1 << 22)
 #define	AML_UART_RX_RST		(1 << 23)
 #define	AML_UART_CLEAR_ERR	(1 << 24)
-#define	AML_UART_PARITY_EN	(1 << 26)
+#define	AML_UART_PARITY_EN	(1 << 19)
 #define	AML_UART_RX_INT_EN	(1 << 27)
 #define	AML_UART_TX_INT_EN	(1 << 28)
 #define	AML_UART_PARITY_TYPE	(1 << 18)	/* 0=even, 1=odd */

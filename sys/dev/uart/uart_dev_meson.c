@@ -84,6 +84,9 @@ static int
 meson_uart_probe(struct uart_bas *bas)
 {
 
+	/* Meson UART registers require 32-bit access. */
+	bas->regiowidth = 4;
+
 	return (0);
 }
 
@@ -92,6 +95,9 @@ meson_uart_init(struct uart_bas *bas, int baudrate, int databits,
     int stopbits, int parity)
 {
 	uint32_t val;
+
+	/* Meson UART registers require 32-bit access. */
+	bas->regiowidth = 4;
 
 	/* Reset TX and RX, clear errors. */
 	val = uart_getreg(bas, AML_UART_CONTROL);
