@@ -404,6 +404,7 @@ dev/iicbus/controller/twsi/mv_twsi.c		optional twsi fdt
 dev/iicbus/controller/twsi/a10_twsi.c		optional twsi fdt
 dev/iicbus/controller/twsi/twsi.c		optional twsi fdt
 dev/iicbus/controller/rockchip/rk_i2c.c		optional rk_i2c fdt
+dev/iicbus/controller/amlogic/meson_i2c.c	optional meson_i2c fdt
 
 dev/ipmi/ipmi.c					optional ipmi
 dev/ipmi/ipmi_acpi.c				optional ipmi acpi
@@ -579,6 +580,12 @@ dev/clk/meson/meson_clk_gxbb.c			optional soc_amlogic_s905x meson_clk fdt
 dev/clk/meson/meson_reset.c			optional soc_amlogic_s905x fdt
 # Amlogic Meson pinctrl/GPIO
 arm/amlogic/meson_pinctrl.c			optional gpio soc_amlogic_s905x fdt
+# Amlogic Meson MDIO mux (internal PHY power-on)
+arm/amlogic/meson_mdio_mux.c			optional soc_amlogic_s905x fdt
+# Amlogic Meson GXL internal PHY driver
+dev/mii/meson_gxl_phy.c			optional miibus soc_amlogic_s905x
+# Amlogic Meson DWC GMAC glue
+dev/dwc/if_dwc_meson.c				optional fdt dwc_meson soc_amlogic_s905x
 # Amlogic Meson MMC host controller
 dev/mmc/host/meson_mmc.c			optional mmc soc_amlogic_s905x fdt
 

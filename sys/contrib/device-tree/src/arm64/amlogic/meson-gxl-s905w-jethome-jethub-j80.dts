@@ -35,6 +35,8 @@
 
 	chosen {
 		stdout-path = "serial0:115200n8";
+		/* XXX FreeBSD bringup: revert/remove when upstreaming */
+		freebsd,version = "16.0-CURRENT";
 	};
 
 	vddio_ao18: regulator-vddio-ao18 {
@@ -198,6 +200,10 @@
 	status = "okay";
 	phy-mode = "rmii";
 	phy-handle = <&internal_phy>;
+
+	/* FreeBSD if_dwc requires reset-names = "stmmaceth" */
+	resets = <&reset RESET_ETHERNET>;
+	reset-names = "stmmaceth";
 };
 
 &internal_phy {
