@@ -105,6 +105,7 @@ struct meson_mmc_softc {
 	struct mmc_host		host;
 	struct mmc_helper	mmc_helper;
 	struct mmc_request	*req;
+	struct mmc_command	*cur_cmd;	/* cmd being executed */
 
 	clk_t			clk_core;
 	clk_t			clk_clkin0;
@@ -117,6 +118,17 @@ struct meson_mmc_softc {
 	void			*dma_buf;
 	bus_addr_t		dma_buf_phys;
 	int			dma_map_err;
+
+	/* DMA descriptor (for descriptor chain mode) */
+	bus_dma_tag_t		desc_tag;
+	bus_dmamap_t		desc_map;
+	struct meson_mmc_desc	*desc_buf;
+	bus_addr_t		desc_phys;
+	int			desc_map_err;
+
+	/* Tuning state */
+	bool			tuning_done;
+	int			tuning_error;
 };
 
 static struct resource_spec meson_mmc_res_spec[] = {
@@ -137,6 +149,8 @@ static void meson_mmc_intr(void *arg);
 static void meson_mmc_timeout(void *arg);
 static void meson_mmc_req_done(struct meson_mmc_softc *sc);
 static void meson_mmc_helper_cd_handler(device_t dev, bool present);
+static void meson_mmc_stop_engine(struct meson_mmc_softc *sc);
+static int meson_mmc_do_tuning(struct meson_mmc_softc *sc);
 
 /* ---- Utility: compute log2 for power-of-2 values ---- */
 static inline uint32_t
@@ -212,6 +226,67 @@ meson_mmc_teardown_dma(struct meson_mmc_softc *sc)
 	bus_dma_tag_destroy(sc->dma_tag);
 }
 
+/* ---- Descriptor DMA buffer setup ---- */
+
+static void
+meson_desc_dma_cb(void *arg, bus_dma_segment_t *segs, int nsegs, int err)
+{
+	struct meson_mmc_softc *sc = arg;
+
+	if (err) {
+		sc->desc_map_err = err;
+		return;
+	}
+	sc->desc_phys = segs[0].ds_addr;
+}
+
+static int
+meson_mmc_setup_desc(struct meson_mmc_softc *sc)
+{
+	int error;
+
+	error = bus_dma_tag_create(
+	    bus_get_dma_tag(sc->dev),		/* parent */
+	    16, 0,				/* align, boundary */
+	    BUS_SPACE_MAXADDR_32BIT,		/* lowaddr */
+	    BUS_SPACE_MAXADDR,			/* highaddr */
+	    NULL, NULL,				/* filter, filterarg */
+	    sizeof(struct meson_mmc_desc), 1,	/* maxsize, nsegments */
+	    sizeof(struct meson_mmc_desc),	/* maxsegsize */
+	    0,					/* flags */
+	    NULL, NULL,				/* lock, lockarg */
+	    &sc->desc_tag);
+	if (error)
+		return (error);
+
+	error = bus_dmamem_alloc(sc->desc_tag, (void **)&sc->desc_buf,
+	    BUS_DMA_COHERENT | BUS_DMA_WAITOK | BUS_DMA_ZERO,
+	    &sc->desc_map);
+	if (error)
+		return (error);
+
+	error = bus_dmamap_load(sc->desc_tag, sc->desc_map,
+	    sc->desc_buf, sizeof(struct meson_mmc_desc),
+	    meson_desc_dma_cb, sc, 0);
+	if (error)
+		return (error);
+	if (sc->desc_map_err)
+		return (sc->desc_map_err);
+
+	return (0);
+}
+
+static void
+meson_mmc_teardown_desc(struct meson_mmc_softc *sc)
+{
+
+	if (sc->desc_tag == NULL)
+		return;
+	bus_dmamap_unload(sc->desc_tag, sc->desc_map);
+	bus_dmamem_free(sc->desc_tag, sc->desc_buf, sc->desc_map);
+	bus_dma_tag_destroy(sc->desc_tag);
+}
+
 /* ---- Hardware clock programming ---- */
 
 /*
@@ -273,6 +348,8 @@ meson_mmc_set_clock(struct meson_mmc_softc *sc, uint32_t freq)
 	clk_reg |= (CLK_PHASE_0 << CLK_RX_PHASE_SHIFT);
 	clk_reg |= CLK_ALWAYS_ON;
 	MMC_WRITE_4(sc, MESON_SD_EMMC_CLOCK, clk_reg);
+	wmb();
+	DELAY(100);
 
 	/* Ungate the clock */
 	MMC_WRITE_4(sc, MESON_SD_EMMC_CFG,
@@ -304,17 +381,69 @@ static void
 meson_mmc_hw_init(struct meson_mmc_softc *sc)
 {
 
-	/* Set up CFG register defaults */
 	meson_mmc_cfg_init(sc);
 
-	/* Set initial clock to 400 KHz for card identification */
+	/*
+	 * Clear delay and adjust registers.
+	 * U-Boot may have left resampling enabled with tuned delay
+	 * values that are inappropriate for our clock configuration.
+	 * Linux does this via meson_mmc_disable_resampling() in set_ios.
+	 */
+	MMC_WRITE_4(sc, MESON_SD_EMMC_DELAY1, 0);
+	MMC_WRITE_4(sc, MESON_SD_EMMC_ADJUST, 0);
+
 	meson_mmc_set_clock(sc, 400000);
 
+	/* Stop execution */
+	MMC_WRITE_4(sc, MESON_SD_EMMC_START, 0);
+
 	/* Clear any pending status/IRQs */
+	MMC_WRITE_4(sc, MESON_SD_EMMC_IRQ_EN, 0);
 	MMC_WRITE_4(sc, MESON_SD_EMMC_STATUS,
 	    MMC_READ_4(sc, MESON_SD_EMMC_STATUS));
+	MMC_WRITE_4(sc, MESON_SD_EMMC_IRQ_EN, IRQ_EN_MASK);
+}
 
-	/* Enable interrupts: errors + end-of-chain */
+/* ---- Error recovery ---- */
+
+/*
+ * Wait for the controller to become idle after stopping.
+ * Linux: meson_mmc_wait_desc_stop() — polls STATUS for up to 5ms.
+ */
+static void
+meson_mmc_wait_busy(struct meson_mmc_softc *sc)
+{
+	int i;
+
+	for (i = 0; i < 50; i++) {
+		if (!(MMC_READ_4(sc, MESON_SD_EMMC_STATUS) &
+		    (STATUS_BUSY | STATUS_DESC_BUSY)))
+			return;
+		DELAY(100);
+	}
+}
+
+/*
+ * Stop the controller after an error.
+ *
+ * Only stop the descriptor engine and wait for idle — do NOT
+ * reinitialize CFG, clock, or delay registers.  Resetting CFG
+ * would clear bus_width to 1-bit while the card is still in
+ * 4-bit mode, causing all subsequent commands to fail.
+ *
+ * Linux reference: meson_mmc_wait_desc_stop() — just stops and waits.
+ */
+static void
+meson_mmc_stop_engine(struct meson_mmc_softc *sc)
+{
+
+	MMC_WRITE_4(sc, MESON_SD_EMMC_START, 0);
+	meson_mmc_wait_busy(sc);
+
+	/* Clear pending status/IRQs */
+	MMC_WRITE_4(sc, MESON_SD_EMMC_IRQ_EN, 0);
+	MMC_WRITE_4(sc, MESON_SD_EMMC_STATUS,
+	    MMC_READ_4(sc, MESON_SD_EMMC_STATUS));
 	MMC_WRITE_4(sc, MESON_SD_EMMC_IRQ_EN, IRQ_EN_MASK);
 }
 
@@ -356,15 +485,58 @@ meson_mmc_timeout(void *arg)
 		return;
 
 	device_printf(sc->dev, "timeout, CMD%u status=0x%08x\n",
-	    sc->req->cmd->opcode,
+	    sc->cur_cmd->opcode,
 	    MMC_READ_4(sc, MESON_SD_EMMC_STATUS));
 
-	sc->req->cmd->error = MMC_ERR_TIMEOUT;
+	sc->cur_cmd->error = MMC_ERR_TIMEOUT;
 
-	/* Stop the controller */
-	MMC_WRITE_4(sc, MESON_SD_EMMC_START, 0);
-
+	meson_mmc_stop_engine(sc);
 	meson_mmc_req_done(sc);
+}
+
+/*
+ * Send a bare command via register-direct mode.
+ * Used to chain the stop command (CMD12) after multi-block transfers.
+ * Caller must hold the mutex.
+ */
+static void
+meson_mmc_send_cmd(struct meson_mmc_softc *sc, struct mmc_command *cmd)
+{
+	uint32_t cmd_cfg;
+
+	cmd_cfg = 0;
+	cmd_cfg |= (cmd->opcode << CMD_CFG_CMD_INDEX_SHIFT) &
+	    CMD_CFG_CMD_INDEX_MASK;
+	cmd_cfg |= CMD_CFG_OWNER;
+
+	if (!(cmd->flags & MMC_RSP_PRESENT))
+		cmd_cfg |= CMD_CFG_NO_RESP;
+	else {
+		if (cmd->flags & MMC_RSP_136)
+			cmd_cfg |= CMD_CFG_RESP_128;
+		cmd_cfg |= CMD_CFG_RESP_NUM;
+		if (!(cmd->flags & MMC_RSP_CRC))
+			cmd_cfg |= CMD_CFG_RESP_NOCRC;
+		if (cmd->flags & MMC_RSP_BUSY)
+			cmd_cfg |= CMD_CFG_R1B;
+	}
+
+	/*
+	 * Use the longer data timeout for stop commands — CMD12 after
+	 * a multi-block write has an R1b response where the card may
+	 * hold DAT0 low for hundreds of ms while programming flash.
+	 */
+	cmd_cfg |= (meson_mmc_ilog2(MESON_MMC_CMD_TIMEOUT_DATA) <<
+	    CMD_CFG_TIMEOUT_SHIFT) & CMD_CFG_TIMEOUT_MASK;
+	cmd_cfg |= CMD_CFG_END_OF_CHAIN;
+
+	sc->cur_cmd = cmd;
+
+	MMC_WRITE_4(sc, MESON_SD_EMMC_CMD_CFG, cmd_cfg);
+	MMC_WRITE_4(sc, MESON_SD_EMMC_CMD_DAT, 0);
+	MMC_WRITE_4(sc, MESON_SD_EMMC_CMD_RSP, 0);
+	wmb();
+	MMC_WRITE_4(sc, MESON_SD_EMMC_CMD_ARG, cmd->arg);
 }
 
 static void
@@ -394,17 +566,37 @@ meson_mmc_intr(void *arg)
 		return;
 	}
 
-	cmd = sc->req->cmd;
+	cmd = sc->cur_cmd;
 
 	/* Check for errors first */
 	if (status & IRQ_ERR_MASK) {
+		device_printf(sc->dev,
+		    "CMD%u error: status=0x%08x (raw=0x%08x)\n",
+		    cmd->opcode, status,
+		    MMC_READ_4(sc, MESON_SD_EMMC_STATUS));
+
 		if (status & IRQ_TIMEOUTS)
 			cmd->error = MMC_ERR_TIMEOUT;
 		else
 			cmd->error = MMC_ERR_FAILED;
 
-		/* Stop the controller on error */
-		MMC_WRITE_4(sc, MESON_SD_EMMC_START, 0);
+		meson_mmc_stop_engine(sc);
+
+		/*
+		 * After a multi-block transfer error, send CMD12
+		 * (STOP_TRANSMISSION) to reset the card state.
+		 * Without this, the card stays in data-receive/transmit
+		 * mode and all subsequent commands will timeout.
+		 *
+		 * Linux: meson_mmc_get_next_command() sends mrq->stop
+		 * when cmd->error is set on multi-block ops.
+		 */
+		if (cmd == sc->req->cmd && sc->req->stop != NULL) {
+			meson_mmc_send_cmd(sc, sc->req->stop);
+			MMC_UNLOCK(sc);
+			return;
+		}
+
 		meson_mmc_req_done(sc);
 		return;
 	}
@@ -415,14 +607,29 @@ meson_mmc_intr(void *arg)
 
 		data = cmd->data;
 		if (data != NULL) {
-			if (!(data->flags & MMC_DATA_WRITE)) {
-				/* Read: copy from bounce buffer to data buf */
+			if (data->flags & MMC_DATA_WRITE) {
+				bus_dmamap_sync(sc->dma_tag, sc->dma_map,
+				    BUS_DMASYNC_POSTWRITE);
+			} else {
+				bus_dmamap_sync(sc->dma_tag, sc->dma_map,
+				    BUS_DMASYNC_POSTREAD);
 				memcpy(data->data, sc->dma_buf,
 				    data->len);
 			}
 			data->xfer_len = data->len;
 		}
 		cmd->error = MMC_ERR_NONE;
+
+		/*
+		 * If the main command had a stop command (CMD12)
+		 * and we haven't sent it yet, chain it now.
+		 */
+		if (cmd == sc->req->cmd && sc->req->stop != NULL) {
+			meson_mmc_send_cmd(sc, sc->req->stop);
+			MMC_UNLOCK(sc);
+			return;
+		}
+
 		meson_mmc_req_done(sc);
 		return;
 	}
@@ -449,6 +656,7 @@ meson_mmc_request(device_t bus, device_t child, struct mmc_request *req)
 	}
 	sc->req = req;
 	cmd = req->cmd;
+	sc->cur_cmd = cmd;
 	cmd->error = MMC_ERR_NONE;
 
 	/* Build CMD_CFG */
@@ -457,12 +665,13 @@ meson_mmc_request(device_t bus, device_t child, struct mmc_request *req)
 	    CMD_CFG_CMD_INDEX_MASK;
 	cmd_cfg |= CMD_CFG_OWNER;
 
-	/* Response type */
+	/* Response type — match Linux meson_mmc_set_response_bits() */
 	if (!(cmd->flags & MMC_RSP_PRESENT))
 		cmd_cfg |= CMD_CFG_NO_RESP;
 	else {
 		if (cmd->flags & MMC_RSP_136)
 			cmd_cfg |= CMD_CFG_RESP_128;
+		cmd_cfg |= CMD_CFG_RESP_NUM;
 		if (!(cmd->flags & MMC_RSP_CRC))
 			cmd_cfg |= CMD_CFG_RESP_NOCRC;
 		if (cmd->flags & MMC_RSP_BUSY)
@@ -513,6 +722,11 @@ meson_mmc_request(device_t bus, device_t child, struct mmc_request *req)
 			/* Copy data to bounce buffer */
 			memcpy(sc->dma_buf, cmd->data->data,
 			    cmd->data->len);
+			bus_dmamap_sync(sc->dma_tag, sc->dma_map,
+			    BUS_DMASYNC_PREWRITE);
+		} else {
+			bus_dmamap_sync(sc->dma_tag, sc->dma_map,
+			    BUS_DMASYNC_PREREAD);
 		}
 
 		cmd_data = sc->dma_buf_phys & CMD_DATA_ADDR_MASK;
@@ -522,15 +736,16 @@ meson_mmc_request(device_t bus, device_t child, struct mmc_request *req)
 		    CMD_CFG_TIMEOUT_SHIFT) & CMD_CFG_TIMEOUT_MASK;
 	}
 
-	/* Mark end of chain (single descriptor mode) */
+	/* Mark end of chain (single descriptor) */
 	cmd_cfg |= CMD_CFG_END_OF_CHAIN;
 
 	/* Stop any previous operation */
 	MMC_WRITE_4(sc, MESON_SD_EMMC_START, 0);
 
 	/*
-	 * Write registers in order: CMD_CFG, CMD_DAT, CMD_RSP, then CMD_ARG.
-	 * Writing CMD_ARG last triggers the command execution.
+	 * Register-direct mode: write CMD_CFG, CMD_DAT, CMD_RSP
+	 * then CMD_ARG last (triggers execution).
+	 * Linux reference: meson_mmc_start_cmd() in meson-gx-mmc.c
 	 */
 	MMC_WRITE_4(sc, MESON_SD_EMMC_CMD_CFG, cmd_cfg);
 	MMC_WRITE_4(sc, MESON_SD_EMMC_CMD_DAT, cmd_data);
@@ -545,6 +760,126 @@ meson_mmc_request(device_t bus, device_t child, struct mmc_request *req)
 	MMC_UNLOCK(sc);
 	return (0);
 }
+
+/* ---- Resampling tuning ---- */
+
+/*
+ * Completion callback for tuning commands.
+ * Called from meson_mmc_req_done() after the lock is released.
+ */
+static void
+meson_mmc_tuning_cb(struct mmc_request *req)
+{
+	struct meson_mmc_softc *sc = req->done_data;
+
+	MMC_LOCK(sc);
+	sc->tuning_error = req->cmd->error;
+	sc->tuning_done = true;
+	wakeup(sc);
+	MMC_UNLOCK(sc);
+}
+
+/*
+ * Send a single-block read (CMD17) and wait for completion.
+ * Used as a tuning probe — if the CRC passes, the timing is good.
+ * CMD19 (SEND_TUNING_BLOCK) only works in UHS-I mode; CMD17
+ * works in all modes including plain High Speed.
+ */
+static int
+meson_mmc_send_tuning_cmd(struct meson_mmc_softc *sc)
+{
+	struct mmc_request req;
+	struct mmc_command cmd;
+	struct mmc_data data;
+	uint8_t buf[MMC_SECTOR_SIZE];
+
+	memset(&req, 0, sizeof(req));
+	memset(&cmd, 0, sizeof(cmd));
+	memset(&data, 0, sizeof(data));
+
+	cmd.opcode = MMC_READ_SINGLE_BLOCK;
+	cmd.arg = 0;
+	cmd.flags = MMC_RSP_R1 | MMC_CMD_ADTC;
+	cmd.data = &data;
+	cmd.mrq = &req;
+
+	data.len = MMC_SECTOR_SIZE;
+	data.data = buf;
+	data.flags = MMC_DATA_READ;
+	data.mrq = &req;
+
+	req.cmd = &cmd;
+	req.done = meson_mmc_tuning_cb;
+	req.done_data = sc;
+
+	sc->tuning_done = false;
+	sc->tuning_error = MMC_ERR_TIMEOUT;
+
+	meson_mmc_request(sc->dev, sc->child, &req);
+
+	MMC_LOCK(sc);
+	while (!sc->tuning_done)
+		msleep(sc, &sc->mtx, 0, "mmctune", hz);
+	MMC_UNLOCK(sc);
+
+	return (sc->tuning_error);
+}
+
+/*
+ * Perform resampling tuning.
+ *
+ * Enable the ADJUST delay line and iterate through delay values
+ * until a tuning read succeeds.  The delay is measured in source
+ * clock cycles (1 ns at 1 GHz), and the valid range is
+ * 0 .. (src_rate / mmc_rate - 1).
+ *
+ * Linux reference: meson_mmc_resampling_tuning() in meson-gx-mmc.c
+ */
+static int
+meson_mmc_do_tuning(struct meson_mmc_softc *sc)
+{
+	uint32_t max_dly, dly, val, src_rate;
+	uint32_t mmc_rate;
+	int err;
+
+	mmc_rate = sc->host.ios.clock;
+	if (mmc_rate == 0 || mmc_rate <= 25000000)
+		return (0);
+
+	/* Determine source clock rate from current CLOCK register */
+	val = MMC_READ_4(sc, MESON_SD_EMMC_CLOCK);
+	if (val & CLK_SRC_MASK)
+		src_rate = MESON_MMC_CLK_DIV2_RATE;
+	else
+		src_rate = MESON_MMC_CLK_XTAL_RATE;
+
+	max_dly = src_rate / mmc_rate;
+
+	/* Enable resampling */
+	val = MMC_READ_4(sc, MESON_SD_EMMC_ADJUST);
+	val |= ADJUST_ADJ_EN;
+
+	for (dly = 0; dly < max_dly; dly++) {
+		val &= ~ADJUST_ADJ_DELAY_MASK;
+		val |= (dly << 16) & ADJUST_ADJ_DELAY_MASK;
+		MMC_WRITE_4(sc, MESON_SD_EMMC_ADJUST, val);
+
+		err = meson_mmc_send_tuning_cmd(sc);
+		if (err == 0) {
+			device_printf(sc->dev,
+			    "resampling tuning: delay=%u/%u\n",
+			    dly, max_dly);
+			return (0);
+		}
+	}
+
+	/* All delays failed — disable resampling */
+	device_printf(sc->dev, "resampling tuning failed\n");
+	MMC_WRITE_4(sc, MESON_SD_EMMC_ADJUST, 0);
+	return (EIO);
+}
+
+/* ---- mmcbr interface ---- */
 
 static int
 meson_mmc_update_ios(device_t bus, device_t child)
@@ -573,10 +908,22 @@ meson_mmc_update_ios(device_t bus, device_t child)
 	MMC_WRITE_4(sc, MESON_SD_EMMC_CFG, cfg);
 
 	/* Set clock rate */
-	if (ios->clock != 0)
+	if (ios->clock != 0) {
 		meson_mmc_set_clock(sc, ios->clock);
-	else
+
+		/*
+		 * Perform resampling tuning when switching to > 25 MHz.
+		 * The MMC core only calls mmcbr_tune() for UHS-I/HS200+,
+		 * but we also need it for plain HS mode due to signal
+		 * path delays.  Disable resampling at lower speeds.
+		 */
+		if (ios->clock > 25000000 && sc->child != NULL)
+			meson_mmc_do_tuning(sc);
+		else
+			MMC_WRITE_4(sc, MESON_SD_EMMC_ADJUST, 0);
+	} else {
 		meson_mmc_set_clock(sc, 0);
+	}
 
 	/* Handle power mode */
 	switch (ios->power_mode) {
@@ -774,6 +1121,33 @@ meson_mmc_probe(device_t dev)
 	if (ofw_bus_search_compatible(dev, compat_data)->ocd_data == 0)
 		return (ENXIO);
 
+	/*
+	 * Reject controllers whose power sequence we cannot handle.
+	 *
+	 * WiFi (sd_emmc_a) uses mmc-pwrseq-simple which requires an
+	 * external 32 kHz clock and GPIO sequencing we don't support.
+	 *
+	 * eMMC (sd_emmc_c) uses mmc-pwrseq-emmc which just needs a
+	 * reset GPIO pulse.  U-Boot has already reset the eMMC, so we
+	 * can safely attach without re-driving the reset sequence.
+	 */
+	{
+		phandle_t pwrseq;
+		pcell_t pwrseq_xref;
+
+		if (OF_getencprop(ofw_bus_get_node(dev), "mmc-pwrseq",
+		    &pwrseq_xref, sizeof(pwrseq_xref)) > 0) {
+			pwrseq = OF_node_from_xref(pwrseq_xref);
+			if (pwrseq > 0 && ofw_bus_node_is_compatible(pwrseq,
+			    "mmc-pwrseq-simple")) {
+				device_printf(dev,
+				    "mmc-pwrseq-simple not supported, "
+				    "skipping\n");
+				return (ENXIO);
+			}
+		}
+	}
+
 	device_set_desc(dev, "Amlogic Meson SD/eMMC Host Controller");
 	return (BUS_PROBE_DEFAULT);
 }
@@ -795,17 +1169,52 @@ meson_mmc_attach(device_t dev)
 		return (ENXIO);
 	}
 
-	/* Set up interrupt */
-	if (bus_setup_intr(dev, sc->irq_res,
-	    INTR_TYPE_NET | INTR_MPSAFE, NULL, meson_mmc_intr, sc,
-	    &sc->intrhand) != 0) {
-		device_printf(dev, "cannot setup interrupt handler\n");
-		bus_release_resources(dev, meson_mmc_res_spec, &sc->mem_res);
-		return (ENXIO);
-	}
-
 	mtx_init(&sc->mtx, device_get_nameunit(dev), "meson_mmc", MTX_DEF);
 	callout_init_mtx(&sc->timeout_co, &sc->mtx, 0);
+
+	/*
+	 * Enable clock gates BEFORE setting up the interrupt handler.
+	 * The IRQ handler reads MESON_SD_EMMC_STATUS (offset 0x44),
+	 * which requires both the bus gate and functional clock to be
+	 * active — otherwise the AXI bus hangs.  A stale IRQ pending
+	 * from U-Boot could fire immediately after bus_setup_intr().
+	 */
+
+	/* Enable the "core" bus gate clock (HHI_GCLK_MPEG0) */
+	error = clk_get_by_ofw_name(dev, 0, "core", &sc->clk_core);
+	if (error != 0) {
+		device_printf(dev, "cannot get core clock\n");
+		goto fail;
+	}
+	error = clk_enable(sc->clk_core);
+	if (error != 0) {
+		device_printf(dev, "cannot enable core clock: %d\n", error);
+		goto fail;
+	}
+
+	/*
+	 * Enable the functional clock gate (clkin0 from HHI).
+	 * The HHI clock controller configures mux=xtal(24MHz)/div=1;
+	 * we just need to open the gate so the controller gets a clock.
+	 */
+	error = clk_get_by_ofw_name(dev, 0, "clkin0", &sc->clk_clkin0);
+	if (error != 0) {
+		device_printf(dev, "cannot get clkin0 clock\n");
+		goto fail;
+	}
+	error = clk_enable(sc->clk_clkin0);
+	if (error != 0) {
+		device_printf(dev, "cannot enable clkin0: %d\n", error);
+		goto fail;
+	}
+
+	/* Get and enable clkin1 (fclk_div2) — needed when source 1 is selected */
+	if (clk_get_by_ofw_name(dev, 0, "clkin1", &sc->clk_clkin1) == 0) {
+		error = clk_enable(sc->clk_clkin1);
+		if (error != 0)
+			device_printf(dev,
+			    "cannot enable clkin1: %d\n", error);
+	}
 
 	/* Get and deassert reset */
 	if (hwreset_get_by_ofw_idx(dev, 0, 0, &sc->rst) == 0) {
@@ -816,23 +1225,43 @@ meson_mmc_attach(device_t dev)
 	}
 
 	/*
-	 * TODO: STUB -- clock handling
+	 * Initialize the controller's clock from scratch.
 	 *
-	 * Current behaviour:
-	 *   We attempt to get the "core" clock and enable it.
-	 *   The "clkin0" and "clkin1" clocks (crystal and fclk_div2)
-	 *   are optional -- the controller's internal divider is
-	 *   programmed directly based on known fixed frequencies.
+	 * After reset, SD_EMMC_CLOCK is 0 — no source or divider.
+	 * Registers at offset >= 0x40 are inaccessible until the
+	 * functional clock is running.
 	 *
-	 * For a full implementation:
-	 *   - Get clkin0/clkin1, query their actual rates
-	 *   - Register the controller's internal mux+divider as clock nodes
-	 *   - Use clk_set_freq() for rate changes
+	 * Program a minimal clock: clkin0 (xtal 24 MHz from HHI),
+	 * max divider (24/63 ≈ 381 KHz), core phase 180°, always-on.
+	 *
+	 * Linux reference: meson_mmc_clk_init() in meson-gx-mmc.c
 	 */
-	if (clk_get_by_ofw_name(dev, 0, "core", &sc->clk_core) == 0)
-		clk_enable(sc->clk_core);
-	clk_get_by_ofw_name(dev, 0, "clkin0", &sc->clk_clkin0);
-	clk_get_by_ofw_name(dev, 0, "clkin1", &sc->clk_clkin1);
+	{
+		uint32_t clk_reg;
+
+		clk_reg = CLK_ALWAYS_ON;
+		clk_reg |= CLK_DIV_MASK;	/* div = 63 (slowest) */
+		clk_reg |= (CLK_PHASE_180 << CLK_CORE_PHASE_SHIFT);
+		clk_reg |= (CLK_PHASE_0 << CLK_TX_PHASE_SHIFT);
+		clk_reg |= (CLK_PHASE_0 << CLK_RX_PHASE_SHIFT);
+		/* source 0 = clkin0 (xtal 24 MHz via HHI gate) */
+
+		MMC_WRITE_4(sc, MESON_SD_EMMC_CLOCK, clk_reg);
+		wmb();
+		DELAY(100);
+
+		device_printf(dev, "init CLOCK=0x%08x\n",
+		    MMC_READ_4(sc, MESON_SD_EMMC_CLOCK));
+	}
+
+	/* Now safe to set up interrupt — clocks are active */
+	if (bus_setup_intr(dev, sc->irq_res,
+	    INTR_TYPE_NET | INTR_MPSAFE, NULL, meson_mmc_intr, sc,
+	    &sc->intrhand) != 0) {
+		device_printf(dev, "cannot setup interrupt handler\n");
+		error = ENXIO;
+		goto fail;
+	}
 
 	/* Set up DMA bounce buffer */
 	error = meson_mmc_setup_dma(sc);
@@ -840,6 +1269,17 @@ meson_mmc_attach(device_t dev)
 		device_printf(dev, "cannot setup DMA: %d\n", error);
 		goto fail;
 	}
+
+	/* Set up DMA descriptor buffer */
+	error = meson_mmc_setup_desc(sc);
+	if (error != 0) {
+		device_printf(dev, "cannot setup descriptor DMA: %d\n", error);
+		goto fail;
+	}
+
+	device_printf(dev, "bounce DMA=0x%lx desc DMA=0x%lx\n",
+	    (unsigned long)sc->dma_buf_phys,
+	    (unsigned long)sc->desc_phys);
 
 	/* Initialize hardware */
 	meson_mmc_hw_init(sc);
@@ -860,9 +1300,12 @@ meson_mmc_attach(device_t dev)
 	return (0);
 
 fail:
+	meson_mmc_teardown_desc(sc);
+	meson_mmc_teardown_dma(sc);
 	callout_drain(&sc->timeout_co);
 	mtx_destroy(&sc->mtx);
-	bus_teardown_intr(dev, sc->irq_res, sc->intrhand);
+	if (sc->intrhand != NULL)
+		bus_teardown_intr(dev, sc->irq_res, sc->intrhand);
 	bus_release_resources(dev, meson_mmc_res_spec, &sc->mem_res);
 	return (ENXIO);
 }
@@ -878,6 +1321,7 @@ meson_mmc_detach(device_t dev)
 
 	callout_drain(&sc->timeout_co);
 	device_delete_children(dev);
+	meson_mmc_teardown_desc(sc);
 	meson_mmc_teardown_dma(sc);
 
 	if (sc->clk_core != NULL)

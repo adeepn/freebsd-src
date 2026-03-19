@@ -45,6 +45,7 @@
 #define	MESON_SD_EMMC_CLOCK	0x00
 #define	MESON_SD_EMMC_DELAY1	0x04
 #define	MESON_SD_EMMC_DELAY2	0x08
+#define	MESON_SD_EMMC_ADJUST	0x08	/* V2 (GXBB/GXL) adjust register */
 #define	MESON_SD_EMMC_V3_ADJUST	0x0C
 #define	MESON_SD_EMMC_CALOUT	0x10
 #define	MESON_SD_EMMC_START	0x40
@@ -156,6 +157,14 @@
 #define	CMD_DATA_ADDR_MASK	0xFFFFFFFC	/* DMA address, 4-byte aligned */
 #define	CMD_DATA_BIG_ENDIAN	(1u << 1)
 #define	CMD_DATA_SRAM		(1u << 0)
+
+/* ---- Descriptor structure (for descriptor chain mode) ---- */
+struct meson_mmc_desc {
+	uint32_t	cmd_cfg;
+	uint32_t	cmd_arg;
+	uint32_t	cmd_data;
+	uint32_t	cmd_resp;
+};
 
 /* ---- Constants ---- */
 #define	MESON_MMC_CLK_XTAL_RATE	24000000	/* 24 MHz crystal */
