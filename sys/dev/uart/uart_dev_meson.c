@@ -37,6 +37,7 @@
 #include <sys/param.h>
 #include <sys/systm.h>
 #include <sys/bus.h>
+#include <sys/callout.h>
 #include <sys/conf.h>
 #include <sys/kernel.h>
 #include <sys/sysctl.h>
@@ -54,7 +55,7 @@
  * FIFO parameters.  The Meson UART has a 64-byte FIFO by default
  * (UART_0 on the EE domain has 128 bytes, but we use 64 as a safe
  * default).  We trigger the RX interrupt after 1 byte to minimize
- * latency, and the TX interrupt at half-empty.
+ * latency, and the TX interrupt at half-FIFO (matching Linux).
  */
 #define	MESON_UART_FIFOSZ	64
 #define	MESON_UART_RXFIFO_LVL	1
@@ -243,7 +244,46 @@ meson_uart_getc(struct uart_bas *bas, struct mtx *hwmtx)
 
 struct meson_uart_softc {
 	struct uart_softc base;
+	struct callout    tx_callout;
 };
+
+/*
+ * TX callout — safety net for edge-triggered interrupt races.
+ *
+ * The Meson UART uses a single edge-triggered interrupt (IRQ_TYPE_EDGE_RISING)
+ * shared between TX and RX via OR.  If the TX FIFO count is already at or
+ * below the threshold when TX_INT_EN is set, no new rising edge occurs and
+ * the TX completion interrupt is lost.  This callout fires after ~5ms to
+ * detect and recover from that condition.
+ */
+static void
+meson_uart_tx_callout(void *arg)
+{
+	struct uart_softc *sc = arg;
+	struct meson_uart_softc *msc = (struct meson_uart_softc *)sc;
+	struct uart_bas *bas = &sc->sc_bas;
+	uint32_t status, ctrl;
+
+	uart_lock(sc->sc_hwmtx);
+	if (sc->sc_txbusy) {
+		status = uart_getreg(bas, AML_UART_STATUS);
+		if (status & AML_UART_TX_EMPTY) {
+			/* TX drained but interrupt was lost — clear up. */
+			ctrl = uart_getreg(bas, AML_UART_CONTROL);
+			ctrl &= ~AML_UART_TX_INT_EN;
+			uart_setreg(bas, AML_UART_CONTROL, ctrl);
+			uart_barrier(bas);
+			sc->sc_txbusy = 0;
+			uart_unlock(sc->sc_hwmtx);
+			uart_sched_softih(sc, SER_INT_TXIDLE);
+			return;
+		}
+		/* FIFO still draining — re-arm the callout. */
+		callout_reset(&msc->tx_callout, max(1, hz / 200),
+		    meson_uart_tx_callout, sc);
+	}
+	uart_unlock(sc->sc_hwmtx);
+}
 
 static int meson_uart_bus_attach(struct uart_softc *);
 static int meson_uart_bus_detach(struct uart_softc *);
@@ -297,10 +337,12 @@ UART_FDT_CLASS_AND_DEVICE(compat_data);
 static int
 meson_uart_bus_attach(struct uart_softc *sc)
 {
+	struct meson_uart_softc *msc = (struct meson_uart_softc *)sc;
 	struct uart_bas *bas;
 	struct uart_devinfo *di;
 
 	bas = &sc->sc_bas;
+	callout_init(&msc->tx_callout, 1);	/* 1 = MP-safe */
 
 	/*
 	 * TODO: STUB -- relies on U-Boot clock configuration
@@ -342,11 +384,15 @@ meson_uart_bus_attach(struct uart_softc *sc)
 static int
 meson_uart_bus_detach(struct uart_softc *sc)
 {
+	struct meson_uart_softc *msc = (struct meson_uart_softc *)sc;
 	struct uart_bas *bas;
+	uint32_t val;
 
 	bas = &sc->sc_bas;
+
+	callout_drain(&msc->tx_callout);
+
 	/* Disable all interrupts. */
-	uint32_t val;
 	val = uart_getreg(bas, AML_UART_CONTROL);
 	val &= ~(AML_UART_RX_INT_EN | AML_UART_TX_INT_EN);
 	uart_setreg(bas, AML_UART_CONTROL, val);
@@ -425,6 +471,7 @@ meson_uart_bus_ioctl(struct uart_softc *sc, int request, intptr_t data)
 static int
 meson_uart_bus_ipend(struct uart_softc *sc)
 {
+	struct meson_uart_softc *msc = (struct meson_uart_softc *)sc;
 	struct uart_bas *bas;
 	uint32_t status, ctrl;
 	int ipend;
@@ -446,14 +493,25 @@ meson_uart_bus_ipend(struct uart_softc *sc)
 	}
 
 	/*
-	 * TX: if TX FIFO is empty (or not full) and TX interrupt is
-	 * enabled, signal TX idle.  Disable TX interrupt to avoid
-	 * re-entry until the next transmit call.
+	 * TX: the Meson UART uses a single edge-triggered interrupt
+	 * for both RX and TX (IRQ_TYPE_EDGE_RISING in the DTS).
+	 *
+	 * Signal TXIDLE only when the TX FIFO is completely empty.
+	 * This ensures the full FIFO capacity is available for the
+	 * next transmit() call.  Checking !TX_FULL (as opposed to
+	 * TX_EMPTY) would fire too early — e.g. when 60+ bytes are
+	 * still in the FIFO — causing the next transmit() to overflow
+	 * and silently drop data.
+	 *
+	 * With edge-triggered interrupts the threshold interrupt
+	 * serves as a wake-up; if TX_EMPTY is not yet true, the
+	 * callout timer (armed in transmit()) will re-check shortly.
 	 */
-	if ((status & AML_UART_TX_EMPTY) && (ctrl & AML_UART_TX_INT_EN)) {
+	if (sc->sc_txbusy && (status & AML_UART_TX_EMPTY)) {
 		ctrl &= ~AML_UART_TX_INT_EN;
 		uart_setreg(bas, AML_UART_CONTROL, ctrl);
 		uart_barrier(bas);
+		callout_stop(&msc->tx_callout);
 		ipend |= SER_INT_TXIDLE;
 	}
 
@@ -492,7 +550,7 @@ meson_uart_bus_probe(struct uart_softc *sc)
 		return (error);
 
 	sc->sc_rxfifosz = MESON_UART_FIFOSZ;
-	sc->sc_txfifosz = MESON_UART_TXFIFO_LVL;
+	sc->sc_txfifosz = MESON_UART_FIFOSZ;
 
 	device_set_desc(sc->sc_dev, "Amlogic Meson UART");
 	return (0);
@@ -539,6 +597,7 @@ meson_uart_bus_setsig(struct uart_softc *sc, int sig)
 static int
 meson_uart_bus_transmit(struct uart_softc *sc)
 {
+	struct meson_uart_softc *msc = (struct meson_uart_softc *)sc;
 	struct uart_bas *bas;
 	uint32_t ctrl;
 	int i;
@@ -561,6 +620,14 @@ meson_uart_bus_transmit(struct uart_softc *sc)
 	ctrl |= AML_UART_TX_INT_EN;
 	uart_setreg(bas, AML_UART_CONTROL, ctrl);
 	uart_barrier(bas);
+
+	/*
+	 * Arm a safety-net callout (~5ms).  If the edge-triggered TX
+	 * interrupt is lost (condition already true when TX_INT_EN was
+	 * set), this callout will detect TX_EMPTY and clear txbusy.
+	 */
+	callout_reset(&msc->tx_callout, 1,
+	    meson_uart_tx_callout, sc);
 
 	uart_unlock(sc->sc_hwmtx);
 	return (0);
