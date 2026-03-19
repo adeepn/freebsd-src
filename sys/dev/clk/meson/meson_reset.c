@@ -42,7 +42,9 @@
  *   Register offset = level_offset + (id / 32) * 4
  *   Bit position    = id % 32
  *
- * Polarity (active-high): bit=1 means reset asserted, bit=0 means deasserted.
+ * Polarity (active-low, level_low_reset): bit=0 means reset asserted,
+ * bit=1 means deasserted (module running).  This matches the Linux
+ * driver's meson8b_param.level_low_reset = true.
  *
  * Linux reference: drivers/reset/amlogic/reset-meson.c
  * FreeBSD template: sys/arm/allwinner/aw_reset.c
@@ -104,9 +106,9 @@ meson_reset_assert(device_t dev, intptr_t id, bool reset)
 	mtx_lock(&sc->mtx);
 	reg_value = RST_READ(sc, RESET_REG(id));
 	if (reset)
-		reg_value |= (1u << RESET_BIT(id));	/* Assert: set bit */
+		reg_value &= ~(1u << RESET_BIT(id));	/* Assert: clear bit */
 	else
-		reg_value &= ~(1u << RESET_BIT(id));	/* Deassert: clear bit */
+		reg_value |= (1u << RESET_BIT(id));	/* Deassert: set bit */
 	RST_WRITE(sc, RESET_REG(id), reg_value);
 	mtx_unlock(&sc->mtx);
 
@@ -128,8 +130,8 @@ meson_reset_is_asserted(device_t dev, intptr_t id, bool *reset)
 	reg_value = RST_READ(sc, RESET_REG(id));
 	mtx_unlock(&sc->mtx);
 
-	/* Active-high: bit set means reset is asserted */
-	*reset = (reg_value & (1u << RESET_BIT(id))) != 0;
+	/* Active-low: bit clear means reset is asserted */
+	*reset = (reg_value & (1u << RESET_BIT(id))) == 0;
 
 	return (0);
 }
