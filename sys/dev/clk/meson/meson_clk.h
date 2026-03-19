@@ -37,17 +37,22 @@
 
 #include <dev/clk/clk.h>
 #include <dev/clk/clk_fixed.h>
+#include <dev/clk/clk_gate.h>
+
+struct syscon;
 
 struct meson_clk_softc {
 	device_t		dev;
-	struct resource		*res;	/* May be NULL for stub drivers */
+	struct resource		*res;	/* direct register access (fallback) */
+	struct syscon		*syscon; /* parent syscon handle for register I/O */
 	struct clkdom		*clkdom;
 	struct mtx		mtx;
 };
 
 DECLARE_CLASS(meson_clkc_driver);
 
-int meson_clk_attach(device_t dev, struct clk_fixed_def *clks, int nclks);
+int meson_clk_attach(device_t dev, struct clk_fixed_def *fixed, int nfixed,
+    struct clk_gate_def *gates, int ngates);
 
 /*
  * Helper macros for defining fixed-rate stub clocks.
@@ -80,6 +85,27 @@ int meson_clk_attach(device_t dev, struct clk_fixed_def *clks, int nclks);
 		},						\
 		.mult = (_mult),				\
 		.div = (_div),					\
+	}
+
+/*
+ * MESON_CLK_GATE: Gate clock controlled by a single bit in an HHI register.
+ *   The parent is typically "clk81" (MPEG bus clock).
+ *   clk_enable()/clk_disable() will set/clear the bit in hardware.
+ */
+#define	MESON_CLK_GATE(_id, _name, _pname, _offset, _bit)	\
+	{							\
+		.clkdef = {					\
+			.id = (_id),				\
+			.name = (_name),			\
+			.parent_names = (const char *[]){_pname}, \
+			.parent_cnt = 1,			\
+		},						\
+		.offset = (_offset),				\
+		.shift = (_bit),				\
+		.mask = 1,					\
+		.on_value = 1,					\
+		.off_value = 0,					\
+		.gate_flags = 0,				\
 	}
 
 #endif /* _DEV_CLK_MESON_CLK_H_ */

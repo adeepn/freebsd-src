@@ -34,18 +34,14 @@
  * SoC-specific drivers (meson_clk_gxbb.c, etc.) subclass this via
  * DEFINE_CLASS_1() and provide their own probe/attach with clock tables.
  *
- * TODO: STUB — core Meson clock controller framework
+ * Register I/O is provided via the parent's syscon handle (for drivers
+ * on simple_mfd, e.g. the EE clock controller) or via a direct resource
+ * (sc->res, for drivers that call bus_alloc_resource themselves).
  *
- * Current behavior:
- *   Only supports registering fixed-rate clocks via meson_clk_attach().
- *   The clkdev_if register I/O methods (read_4, write_4, modify_4) are
- *   present but will return ENXIO when sc->res is NULL (the common case
- *   for the current stub drivers that don't need register access).
+ * Currently supports fixed-rate and gate clocks.
  *
- * For full implementation:
- *   - SoC-specific drivers should allocate a register resource (via
- *     syscon or direct bus_alloc_resource) and store it in sc->res
- *   - Add support for mux, divider, gate, and PLL clock types
+ * TODO:
+ *   - Add support for mux, divider, and PLL clock types
  *   - Implement clk_set_rate()/clk_set_parent() for dynamic clocks
  *   - Add hwreset_if methods if the clock controller also provides
  *     reset functionality (as the AO clock controller does)
@@ -72,7 +68,10 @@
 
 #include <dev/clk/meson/meson_clk.h>
 
+#include <dev/syscon/syscon.h>
+
 #include "clkdev_if.h"
+#include "syscon_if.h"
 
 #if 0
 #define	dprintf(format, arg...)	\
@@ -86,9 +85,16 @@
  *
  * These provide register I/O for clock nodes that need hardware access
  * (mux, divider, gate, PLL clocks).  Fixed-rate clocks do not call
- * these methods.  In the current stub, sc->res is NULL and these
- * return ENXIO — they exist to satisfy the clkdev_if interface
- * contract and will be functional when register resources are added.
+ * these methods.
+ *
+ * Register access uses the parent's syscon (sc->syscon) when available,
+ * falling back to a direct resource (sc->res).  The syscon path is used
+ * by drivers on simple_mfd (EE clkc); the resource path is reserved for
+ * future drivers that allocate their own register space.
+ *
+ * Locking: when using syscon, device_lock/unlock delegates to the
+ * parent's SYSCON_DEVICE_LOCK (spin lock).  The unlocked syscon
+ * accessors are used inside the locked region.
  */
 
 static int
@@ -97,11 +103,16 @@ meson_clk_write_4(device_t dev, bus_addr_t addr, uint32_t val)
 	struct meson_clk_softc *sc;
 
 	sc = device_get_softc(dev);
-	if (sc->res == NULL)
-		return (ENXIO);
 	dprintf("offset=%lx write %x\n", addr, val);
-	bus_write_4(sc->res, addr, val);
-	return (0);
+	if (sc->syscon != NULL) {
+		SYSCON_UNLOCKED_WRITE_4(sc->syscon, addr, val);
+		return (0);
+	}
+	if (sc->res != NULL) {
+		bus_write_4(sc->res, addr, val);
+		return (0);
+	}
+	return (ENXIO);
 }
 
 static int
@@ -110,28 +121,39 @@ meson_clk_read_4(device_t dev, bus_addr_t addr, uint32_t *val)
 	struct meson_clk_softc *sc;
 
 	sc = device_get_softc(dev);
-	if (sc->res == NULL)
-		return (ENXIO);
-	*val = bus_read_4(sc->res, addr);
-	dprintf("offset=%lx read %x\n", addr, *val);
-	return (0);
+	if (sc->syscon != NULL) {
+		*val = SYSCON_UNLOCKED_READ_4(sc->syscon, addr);
+		dprintf("offset=%lx read %x\n", addr, *val);
+		return (0);
+	}
+	if (sc->res != NULL) {
+		*val = bus_read_4(sc->res, addr);
+		dprintf("offset=%lx read %x\n", addr, *val);
+		return (0);
+	}
+	return (ENXIO);
 }
 
 static int
 meson_clk_modify_4(device_t dev, bus_addr_t addr, uint32_t clr, uint32_t set)
 {
 	struct meson_clk_softc *sc;
-	uint32_t reg;
 
 	sc = device_get_softc(dev);
-	if (sc->res == NULL)
-		return (ENXIO);
-	dprintf("offset=%lx clr: %x set: %x\n", addr, clr, set);
-	reg = bus_read_4(sc->res, addr);
-	reg &= ~clr;
-	reg |= set;
-	bus_write_4(sc->res, addr, reg);
-	return (0);
+	if (sc->syscon != NULL) {
+		SYSCON_UNLOCKED_MODIFY_4(sc->syscon, addr, clr, set);
+		return (0);
+	}
+	if (sc->res != NULL) {
+		uint32_t reg;
+
+		reg = bus_read_4(sc->res, addr);
+		reg &= ~clr;
+		reg |= set;
+		bus_write_4(sc->res, addr, reg);
+		return (0);
+	}
+	return (ENXIO);
 }
 
 static void
@@ -140,7 +162,10 @@ meson_clk_device_lock(device_t dev)
 	struct meson_clk_softc *sc;
 
 	sc = device_get_softc(dev);
-	mtx_lock(&sc->mtx);
+	if (sc->syscon != NULL)
+		SYSCON_DEVICE_LOCK(device_get_parent(dev));
+	else
+		mtx_lock(&sc->mtx);
 }
 
 static void
@@ -149,17 +174,22 @@ meson_clk_device_unlock(device_t dev)
 	struct meson_clk_softc *sc;
 
 	sc = device_get_softc(dev);
-	mtx_unlock(&sc->mtx);
+	if (sc->syscon != NULL)
+		SYSCON_DEVICE_UNLOCK(device_get_parent(dev));
+	else
+		mtx_unlock(&sc->mtx);
 }
 
 /*
  * Common attach helper.
  *
- * Creates a clock domain and registers an array of fixed-rate clocks.
- * SoC-specific drivers call this from their attach method.
+ * Creates a clock domain and registers fixed-rate and gate clocks.
+ * SoC-specific drivers call this from their attach method after
+ * setting up sc->syscon or sc->res for register I/O.
  */
 int
-meson_clk_attach(device_t dev, struct clk_fixed_def *clks, int nclks)
+meson_clk_attach(device_t dev, struct clk_fixed_def *fixed, int nfixed,
+    struct clk_gate_def *gates, int ngates)
 {
 	struct meson_clk_softc *sc;
 	int i;
@@ -173,8 +203,11 @@ meson_clk_attach(device_t dev, struct clk_fixed_def *clks, int nclks)
 	if (sc->clkdom == NULL)
 		panic("Cannot create clkdom\n");
 
-	for (i = 0; i < nclks; i++)
-		clknode_fixed_register(sc->clkdom, &clks[i]);
+	for (i = 0; i < nfixed; i++)
+		clknode_fixed_register(sc->clkdom, &fixed[i]);
+
+	for (i = 0; i < ngates; i++)
+		clknode_gate_register(sc->clkdom, &gates[i]);
 
 	if (clkdom_finit(sc->clkdom) != 0)
 		panic("cannot finalize clkdom initialization\n");

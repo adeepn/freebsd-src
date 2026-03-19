@@ -26,41 +26,27 @@
  */
 
 /*
- * Amlogic Meson GXBB/GXL clock controllers — stub implementation.
+ * Amlogic Meson GXBB/GXL clock controllers.
  *
  * This file provides two drivers:
  *   1. EE clock controller (amlogic,gxl-clkc) — main system clocks
  *   2. AO clock controller (amlogic,meson-gx{l,}-aoclkc) — always-on domain
  *
- * Both register only fixed-rate clocks, relying on U-Boot to have
- * already configured PLLs, dividers, and gates to their standard values.
+ * The EE controller implements:
+ *   - Fixed-rate clocks for PLLs and dividers (relying on U-Boot config)
+ *   - Hardware gate clocks via HHI_GCLK_MPEG0/1/2 registers
  *
- * TODO: STUB — relies on U-Boot initialization
+ * The AO controller registers only fixed-rate clocks (gates not yet
+ * implemented — the AO domain is always-on and U-Boot leaves gates open).
  *
- * Current behavior:
- *   All clocks are registered as fixed-rate at their standard GXL
- *   frequencies.  No hardware registers are read or written.
- *   Clock gating (enable/disable) is not implemented — all clocks
- *   are assumed to be always enabled by U-Boot.
+ * TODO: STUB — PLLs and dividers rely on U-Boot initialization
  *
  * For full implementation:
- *   - EE clock controller (amlogic,gxl-clkc):
- *     - Obtain register access via syscon from the parent HHI sysctrl
- *     - Implement PLL clocks: sys_pll, fixed_pll, gp0_pll, hdmi_pll
- *       using HHI_SYS_PLL_CNTL, HHI_FIXED_PLL_CNTL, etc.
- *     - Implement fixed dividers: fclk_div2..7 from fixed_pll
- *     - Implement MPEG clock selector + divider (clk81) from
- *       HHI_MPEG_CLK_CNTL register
- *     - Implement clock gates via HHI_GCLK_MPEG0/1/2 registers
- *     - Implement SD/eMMC mux+divider clocks for dynamic frequency
- *     - Add parent-child relationships for proper clock tree
- *
- *   - AO clock controller (amlogic,meson-gx-aoclkc):
- *     - Obtain register access via syscon from the parent aobus
- *     - Implement AO gate clocks via AO_RTI_GEN_CNTL_REG0
- *     - Implement AO reset functionality (#reset-cells = <1>)
- *       using AO_RTI_GEN_CNTL_REG0 reset bits
- *     - Add 32K clock tree (CEC, RTC oscillator)
+ *   - EE: PLL clocks (sys_pll, fixed_pll, gp0_pll, hdmi_pll)
+ *   - EE: MPEG clock mux+divider (clk81) from HHI_MPEG_CLK_CNTL
+ *   - EE: SD/eMMC mux+divider clocks for dynamic frequency
+ *   - AO: Gate clocks via AO_RTI_GEN_CNTL_REG0
+ *   - AO: Reset functionality (#reset-cells = <1>)
  *
  * Linux reference: drivers/clk/meson/gxbb.c (~92KB, 200+ clocks)
  * Linux reference: drivers/clk/meson/gxbb-aoclk.c (~8KB)
@@ -80,6 +66,8 @@
 #include <dev/clk/clk_fixed.h>
 
 #include <dev/clk/meson/meson_clk.h>
+
+#include "syscon_if.h"
 
 #include <dt-bindings/clock/gxbb-clkc.h>
 #include <dt-bindings/clock/gxbb-aoclkc.h>
@@ -104,89 +92,91 @@
  *   clk81      =  166.67 MHz (MPEG bus clock)
  * ================================================================ */
 
-static struct clk_fixed_def gxl_ee_clks[] = {
-	/*
-	 * PLLs and fixed dividers.
-	 *
-	 * TODO: STUB — relies on U-Boot initialization
-	 *
-	 * Current behavior:
-	 *   Registered as fixed-rate at the standard 2 GHz fixed_pll
-	 *   output.  FCLK dividers are hardcoded to fixed_pll/N.
-	 *
-	 * For full implementation:
-	 *   - Read HHI_FIXED_PLL_CNTL (0x40) to get actual PLL config
-	 *   - Implement fclk_div2..7 as fixed-factor children of fixed_pll
-	 *   - Implement sys_pll, gp0_pll, hdmi_pll with set_rate support
-	 *
-	 * Linux reference: drivers/clk/meson/gxbb.c, lines 50-250
-	 */
+/*
+ * Fixed-rate clocks: PLLs, dividers, and bus clocks.
+ *
+ * TODO: STUB — relies on U-Boot initialization
+ *
+ * For full implementation:
+ *   - Read HHI_FIXED_PLL_CNTL (0x40) to get actual PLL config
+ *   - Implement fclk_div2..7 as fixed-factor children of fixed_pll
+ *   - Implement MPEG clock mux + divider (clk81) from HHI_MPEG_CLK_CNTL
+ *   - Implement SD_EMMC_*_CLK0 as composite mux+divider clocks
+ */
+static struct clk_fixed_def gxl_ee_fixed_clks[] = {
 	MESON_FIXED_RATE(CLKID_FIXED_PLL,  "fixed_pll",  2000000000),
 	MESON_FIXED_RATE(CLKID_FCLK_DIV2,  "fclk_div2",  1000000000),
 	MESON_FIXED_RATE(CLKID_FCLK_DIV3,  "fclk_div3",   666666666),
 	MESON_FIXED_RATE(CLKID_FCLK_DIV4,  "fclk_div4",   500000000),
 	MESON_FIXED_RATE(CLKID_FCLK_DIV5,  "fclk_div5",   400000000),
 	MESON_FIXED_RATE(CLKID_FCLK_DIV7,  "fclk_div7",   285714285),
-
-	/*
-	 * MPEG bus clock (clk81) — primary peripheral bus clock.
-	 *
-	 * TODO: STUB — relies on U-Boot initialization
-	 *
-	 * Current behavior:
-	 *   Registered as fixed 166.67 MHz.
-	 *
-	 * For full implementation:
-	 *   - Read HHI_MPEG_CLK_CNTL (0x50) for mux select and divider
-	 *   - Implement as mux + divider clock with fclk_div* parents
-	 *   - Typically: fclk_div5 (400 MHz) / 2.4 ≈ 166.67 MHz
-	 *     (actual path: fclk_div4 with specific divider settings)
-	 *
-	 * Linux reference: drivers/clk/meson/gxbb.c, mpeg_clk_sel/div/gate
-	 */
 	MESON_FIXED_RATE(CLKID_CLK81,      "clk81",       166666666),
+};
+
+/*
+ * HHI register offsets for clock gate registers.
+ * These are relative to the HHI sysctrl base (0xc883c000 on GXL).
+ * Linux reference: drivers/clk/meson/gxbb.c, lines 40-43
+ */
+#define	HHI_GCLK_MPEG0		0x140
+#define	HHI_GCLK_MPEG1		0x144
+#define	HHI_GCLK_MPEG2		0x148
+
+/*
+ * HHI clock control registers for SD/eMMC controllers.
+ * These contain mux + divider + gate for the controller's functional clock.
+ * We only implement the gate bit; mux/divider are left at U-Boot defaults.
+ * Linux reference: drivers/clk/meson/gxbb.c
+ */
+#define	HHI_SD_EMMC_CLK_CNTL	0x264	/* sd_emmc_a clock control */
+#define	HHI_NAND_CLK_CNTL	0x25C	/* sd_emmc_b (bit 7), sd_emmc_c (bit 23) */
+
+/*
+ * Peripheral bus gate clocks.
+ *
+ * These are single-bit gates in HHI_GCLK_MPEG0/1/2 registers that
+ * enable/disable the bus clock to each peripheral.  clk_enable()
+ * sets the bit (opening the gate); clk_disable() clears it.
+ *
+ * Without opening the gate, register access to the peripheral
+ * controller will hang the AXI bus.
+ *
+ * Bit positions from Linux drivers/clk/meson/gxbb.c (GXBB_PCLK macros).
+ */
+static struct clk_gate_def gxl_ee_gate_clks[] = {
+	/* Peripheral bus gates (HHI_GCLK_MPEGx) */
+	MESON_CLK_GATE(CLKID_SPICC,     "spicc",     "clk81", HHI_GCLK_MPEG0,  8),
+	MESON_CLK_GATE(CLKID_I2C,       "i2c",       "clk81", HHI_GCLK_MPEG0,  9),
+	MESON_CLK_GATE(CLKID_UART0,     "uart0",     "clk81", HHI_GCLK_MPEG0, 13),
+	MESON_CLK_GATE(CLKID_SD_EMMC_A, "sd_emmc_a", "clk81", HHI_GCLK_MPEG0, 24),
+	MESON_CLK_GATE(CLKID_SD_EMMC_B, "sd_emmc_b", "clk81", HHI_GCLK_MPEG0, 25),
+	MESON_CLK_GATE(CLKID_SD_EMMC_C, "sd_emmc_c", "clk81", HHI_GCLK_MPEG0, 26),
+	MESON_CLK_GATE(CLKID_ETH,       "eth",       "clk81", HHI_GCLK_MPEG1,  3),
+	MESON_CLK_GATE(CLKID_UART1,     "uart1",     "clk81", HHI_GCLK_MPEG1, 16),
+	MESON_CLK_GATE(CLKID_UART2,     "uart2",     "clk81", HHI_GCLK_MPEG2, 15),
 
 	/*
-	 * Peripheral bus gates.
-	 * In the real implementation these are gate clocks on clk81,
-	 * controlled by HHI_GCLK_MPEG0/1/2 registers.
+	 * SD/eMMC controller functional clock gates.
+	 *
+	 * These gate the clock that feeds the controller IP itself.
+	 * Without this clock, registers at offset >= 0x40 (CFG, STATUS,
+	 * CMD) are inaccessible and reads/writes will hang the AXI bus.
+	 *
+	 * In Linux these are composite mux+divider+gate clocks.  We only
+	 * implement the gate; the mux and divider are configured to
+	 * xtal/1 (24 MHz) in meson_gxl_clkc_attach().
+	 *
+	 * Register layout (from Linux drivers/clk/meson/gxbb.c):
+	 *   sd_emmc_a: HHI_SD_EMMC_CLK_CNTL (0x264), gate bit 7
+	 *   sd_emmc_b: HHI_SD_EMMC_CLK_CNTL (0x264), gate bit 23
+	 *   sd_emmc_c: HHI_NAND_CLK_CNTL    (0x25C), gate bit 7
 	 */
-	MESON_FIXED_RATE(CLKID_UART0,      "uart0",       166666666),
-	MESON_FIXED_RATE(CLKID_UART1,      "uart1",       166666666),
-	MESON_FIXED_RATE(CLKID_UART2,      "uart2",       166666666),
-	MESON_FIXED_RATE(CLKID_ETH,        "eth",         166666666),
-	MESON_FIXED_RATE(CLKID_SPICC,      "spicc",       166666666),
-	MESON_FIXED_RATE(CLKID_I2C,        "i2c",         166666666),
-	MESON_FIXED_RATE(CLKID_SD_EMMC_A,  "sd_emmc_a",   166666666),
-	MESON_FIXED_RATE(CLKID_SD_EMMC_B,  "sd_emmc_b",   166666666),
-	MESON_FIXED_RATE(CLKID_SD_EMMC_C,  "sd_emmc_c",   166666666),
-
-	/*
-	 * SD/eMMC core clocks — input to the MMC controller's clock mux.
-	 *
-	 * TODO: STUB — relies on U-Boot initialization
-	 *
-	 * Current behavior:
-	 *   Reported as fixed 1 GHz (fclk_div2 frequency).  The Meson
-	 *   GX MMC controller has its own internal clock register
-	 *   (SD_EMMC_CLOCK at offset 0x00) with a mux that selects
-	 *   between clkin0/clkin1/xtal and a divider.  The MMC driver
-	 *   can use this internal divider to derive any card frequency
-	 *   from the 1 GHz input.
-	 *
-	 * For full implementation:
-	 *   - Implement SD_EMMC_*_CLK0_SEL (mux) + SD_EMMC_*_CLK0_DIV
-	 *     (divider) + SD_EMMC_*_CLK0 (composite) clock nodes
-	 *   - Support clk_set_rate() so the MMC driver can request
-	 *     the desired frequency via the clock framework
-	 *   - Parents: xtal (24 MHz), fclk_div2 (1 GHz), fclk_div3,
-	 *     fclk_div5, fclk_div7
-	 *
-	 * Linux reference: drivers/clk/meson/gxbb.c, sd_emmc_*_clk0
-	 */
-	MESON_FIXED_RATE(CLKID_SD_EMMC_A_CLK0, "sd_emmc_a_clk0", 1000000000),
-	MESON_FIXED_RATE(CLKID_SD_EMMC_B_CLK0, "sd_emmc_b_clk0", 1000000000),
-	MESON_FIXED_RATE(CLKID_SD_EMMC_C_CLK0, "sd_emmc_c_clk0", 1000000000),
+	MESON_CLK_GATE(CLKID_SD_EMMC_A_CLK0, "sd_emmc_a_clk0", "fclk_div2",
+	    HHI_SD_EMMC_CLK_CNTL,  7),
+	MESON_CLK_GATE(CLKID_SD_EMMC_B_CLK0, "sd_emmc_b_clk0", "fclk_div2",
+	    HHI_SD_EMMC_CLK_CNTL, 23),
+	MESON_CLK_GATE(CLKID_SD_EMMC_C_CLK0, "sd_emmc_c_clk0", "fclk_div2",
+	    HHI_NAND_CLK_CNTL,     7),
 };
 
 /* ================================================================
@@ -233,15 +223,57 @@ meson_gxl_clkc_probe(device_t dev)
 	if (!ofw_bus_is_compatible(dev, "amlogic,gxl-clkc"))
 		return (ENXIO);
 
-	device_set_desc(dev, "Amlogic Meson GXL Clock Controller (stub)");
+	device_set_desc(dev, "Amlogic Meson GXL Clock Controller");
 	return (BUS_PROBE_DEFAULT);
 }
 
 static int
 meson_gxl_clkc_attach(device_t dev)
 {
+	struct meson_clk_softc *sc;
+	uint32_t val;
 
-	return (meson_clk_attach(dev, gxl_ee_clks, nitems(gxl_ee_clks)));
+	sc = device_get_softc(dev);
+
+	/* Get parent's syscon handle for HHI register access (gate clocks). */
+	if (SYSCON_GET_HANDLE(dev, &sc->syscon) != 0) {
+		device_printf(dev, "cannot get syscon handle\n");
+		return (ENXIO);
+	}
+
+	/*
+	 * Configure HHI SD/eMMC clock control registers with valid
+	 * mux/divider defaults.  Our clock framework only implements
+	 * the gate bit; without valid mux (source) and divider settings,
+	 * enabling the gate won't produce a usable clock.
+	 *
+	 * Set mux to xtal (24 MHz) and divider to 1 for all controllers.
+	 * Gate bits are left untouched (managed by clk_enable/disable).
+	 *
+	 * HHI_SD_EMMC_CLK_CNTL (0x264) layout:
+	 *   sd_emmc_a: mux[11:9], gate[7], div[6:0]
+	 *   sd_emmc_b: mux[27:25], gate[23], div[22:16]
+	 * HHI_NAND_CLK_CNTL (0x25C) layout:
+	 *   sd_emmc_c: mux[11:9], gate[7], div[6:0]
+	 */
+	val = SYSCON_UNLOCKED_READ_4(sc->syscon, HHI_SD_EMMC_CLK_CNTL);
+	/* sd_emmc_a: clear mux[11:9] and div[6:0], keep gate[7] */
+	val &= ~(0x7F | (0x7 << 9));
+	val |= 1;		/* div = 1, mux = 0 (xtal) */
+	/* sd_emmc_b: clear mux[27:25] and div[22:16], keep gate[23] */
+	val &= ~((0x7F << 16) | (0x7 << 25));
+	val |= (1 << 16);	/* div = 1, mux = 0 (xtal) */
+	SYSCON_UNLOCKED_WRITE_4(sc->syscon, HHI_SD_EMMC_CLK_CNTL, val);
+
+	/* sd_emmc_c: clear mux[11:9] and div[6:0], keep gate[7] */
+	val = SYSCON_UNLOCKED_READ_4(sc->syscon, HHI_NAND_CLK_CNTL);
+	val &= ~(0x7F | (0x7 << 9));
+	val |= 1;		/* div = 1, mux = 0 (xtal) */
+	SYSCON_UNLOCKED_WRITE_4(sc->syscon, HHI_NAND_CLK_CNTL, val);
+
+	return (meson_clk_attach(dev, gxl_ee_fixed_clks,
+	    nitems(gxl_ee_fixed_clks), gxl_ee_gate_clks,
+	    nitems(gxl_ee_gate_clks)));
 }
 
 static device_method_t meson_gxl_clkc_methods[] = {
@@ -292,7 +324,8 @@ static int
 meson_gxl_aoclkc_attach(device_t dev)
 {
 
-	return (meson_clk_attach(dev, gxl_ao_clks, nitems(gxl_ao_clks)));
+	return (meson_clk_attach(dev, gxl_ao_clks, nitems(gxl_ao_clks),
+	    NULL, 0));
 }
 
 static device_method_t meson_gxl_aoclkc_methods[] = {
