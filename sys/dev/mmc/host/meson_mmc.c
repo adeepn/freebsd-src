@@ -1286,9 +1286,9 @@ meson_mmc_attach(device_t dev)
 
 	/* Set host capabilities */
 	sc->host.f_min = 400000;
-	sc->host.f_max = 50000000;
+	sc->host.f_max = 25000000;
 	sc->host.host_ocr = MMC_OCR_320_330 | MMC_OCR_330_340;
-	sc->host.caps = MMC_CAP_HSPEED | MMC_CAP_SIGNALING_330;
+	sc->host.caps = MMC_CAP_SIGNALING_330;
 
 	/* Parse DTS for bus-width, max-frequency, etc. */
 	mmc_fdt_parse(dev, 0, &sc->mmc_helper, &sc->host);
