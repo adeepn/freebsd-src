@@ -5,3 +5,6 @@
 # SoC support
 options 	SOC_AMLOGIC_S905X
 options 	FDT
+
+# Serial (COM) ports
+device		uart_meson		# Amlogic Meson UART
