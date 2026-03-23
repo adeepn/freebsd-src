@@ -8,3 +8,6 @@ options 	FDT
 
 # Serial (COM) ports
 device		uart_meson		# Amlogic Meson UART
+
+# Clock and reset controllers
+device		meson_clk		# Amlogic Meson clock controller
