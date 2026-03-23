@@ -595,6 +595,7 @@ arm/amlogic/meson_pinctrl.c			optional gpio soc_amlogic_s905x fdt
 # Amlogic Meson Ethernet
 arm/amlogic/meson_mdio_mux.c			optional soc_amlogic_s905x fdt
 dev/dwc/if_dwc_meson.c				optional fdt dwc_meson soc_amlogic_s905x
+dev/mii/meson_gxl_phy.c			optional miibus soc_amlogic_s905x
 
 # Altera/Intel
 arm64/intel/stratix10-soc-fpga-mgr.c		optional soc_intel_stratix10 fdt
