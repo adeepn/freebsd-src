@@ -450,6 +450,7 @@ dev/mbox/mbox_if.m				optional soc_brcm_bcm2837
 dev/mmc/host/dwmmc_altera.c			optional dwmmc dwmmc_altera fdt
 dev/mmc/host/dwmmc_hisi.c			optional dwmmc dwmmc_hisi fdt
 dev/mmc/host/dwmmc_rockchip.c			optional dwmmc rk_dwmmc fdt
+dev/mmc/host/meson_mmc.c			optional mmc soc_amlogic_s905x fdt
 
 dev/neta/if_mvneta_fdt.c			optional neta fdt
 dev/neta/if_mvneta.c				optional neta mdio mii fdt
