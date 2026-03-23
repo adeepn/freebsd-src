@@ -1,0 +1,7 @@
+#
+# Amlogic Meson SoC support
+#
+
+# SoC support
+options 	SOC_AMLOGIC_S905X
+options 	FDT
