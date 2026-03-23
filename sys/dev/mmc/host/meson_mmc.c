@@ -1161,7 +1161,7 @@ meson_mmc_attach(device_t dev)
 	sc = device_get_softc(dev);
 	sc->dev = dev;
 	sc->req = NULL;
-	sc->timeout_secs = 10;
+	sc->timeout_secs = 40;
 
 	/* Allocate resources (memory + IRQ) */
 	if (bus_alloc_resources(dev, meson_mmc_res_spec, &sc->mem_res) != 0) {

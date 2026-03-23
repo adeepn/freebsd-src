@@ -177,7 +177,7 @@ struct meson_mmc_desc {
 
 /* Timeouts */
 #define	MESON_MMC_CMD_TIMEOUT	1024	/* ms */
-#define	MESON_MMC_CMD_TIMEOUT_DATA 4096	/* ms */
+#define	MESON_MMC_CMD_TIMEOUT_DATA 32768	/* ms — max hw supports (2^15) */
 
 /* Bounce buffer: max 511 blocks * 512 bytes = ~256KB */
 #define	MESON_MMC_BOUNCE_SIZE	(512 * 512)

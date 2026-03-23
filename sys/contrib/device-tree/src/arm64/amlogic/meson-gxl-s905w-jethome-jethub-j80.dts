@@ -150,7 +150,7 @@
 	vqmmc-supply = <&vddio_boot>;
 };
 
-/* SD card */
+/* SD card — limited to 25 MHz (SD-Wire MUX degrades signal at 50 MHz) */
 &sd_emmc_b {
 	status = "okay";
 	pinctrl-0 = <&sdcard_pins>;
@@ -159,7 +159,7 @@
 
 	bus-width = <4>;
 	cap-sd-highspeed;
-	max-frequency = <50000000>;
+	max-frequency = <25000000>;
 	disable-wp;
 
 	cd-gpios = <&gpio CARD_6 GPIO_ACTIVE_LOW>;
