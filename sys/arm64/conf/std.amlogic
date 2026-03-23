@@ -19,3 +19,6 @@ device		pcf8563			# NXP PCF8563 RTC (on J80 i2c_B)
 # Ethernet
 device		dwc			# Synopsys DesignWare GMAC controller
 device		dwc_meson		# Amlogic Meson DWC glue
+
+# DTBs
+makeoptions	MODULES_EXTRA+="dtb/amlogic"
