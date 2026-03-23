@@ -404,6 +404,7 @@ dev/iicbus/controller/twsi/mv_twsi.c		optional twsi fdt
 dev/iicbus/controller/twsi/a10_twsi.c		optional twsi fdt
 dev/iicbus/controller/twsi/twsi.c		optional twsi fdt
 dev/iicbus/controller/rockchip/rk_i2c.c		optional rk_i2c fdt
+dev/iicbus/controller/amlogic/meson_i2c.c	optional meson_i2c fdt
 
 dev/ipmi/ipmi.c					optional ipmi
 dev/ipmi/ipmi_acpi.c				optional ipmi acpi

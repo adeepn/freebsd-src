@@ -11,3 +11,7 @@ device		uart_meson		# Amlogic Meson UART
 
 # Clock and reset controllers
 device		meson_clk		# Amlogic Meson clock controller
+
+# I2C
+device		meson_i2c		# Amlogic Meson I2C controller
+device		pcf8563			# NXP PCF8563 RTC (on J80 i2c_B)
