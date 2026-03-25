@@ -48,6 +48,7 @@
 #include <dev/uart/uart_cpu_fdt.h>
 #include <dev/uart/uart_bus.h>
 #include <dev/uart/uart_dev_meson.h>
+#include <dev/clk/clk.h>
 
 #include "uart_if.h"
 
@@ -155,30 +156,22 @@ meson_uart_init(struct uart_bas *bas, int baudrate, int databits,
 	uart_setreg(bas, AML_UART_CONTROL, val);
 
 	/*
-	 * TODO: STUB -- relies on U-Boot baud rate configuration
+	 * Program baud rate via REG5.
 	 *
-	 * Current behavior:
-	 *   Baud rate is only programmed if both baudrate and rclk are
-	 *   provided. In practice, U-Boot has already configured 115200
-	 *   baud on the console UART before we get here.
+	 * During early boot (console probe), rclk may be 0 because the
+	 * clock framework is not yet available.  In that case, skip
+	 * programming — U-Boot has already configured the baud rate.
+	 * Full programming happens later from bus_attach() after clocks
+	 * are initialized.
 	 *
-	 * For a complete implementation:
-	 *   - Query the actual crystal frequency from the clock framework
-	 *     (24 MHz on all known Meson GX/G12/SM1 SoCs)
-	 *   - Properly handle the xtal_div2 vs xtal_div3 selection
-	 *   - Support runtime baud rate changes for all UART ports
+	 * GXL uses xtal/3 divider.  G12A/S4 would use xtal/2 with
+	 * AML_UART_BAUD_XTAL_DIV2 bit set (not yet supported).
 	 *
-	 * Linux reference: drivers/tty/serial/meson_uart.c,
-	 *   meson_uart_set_termios() and meson_uart_change_speed()
+	 * Linux reference: meson_uart_change_speed() in meson_uart.c
 	 */
 	if (baudrate > 0 && bas->rclk > 0) {
 		uint32_t baud_val;
 
-		/*
-		 * Use the new baud rate register (REG5).
-		 * Formula: divisor = round(xtal_clk / (xtal_div * baud)) - 1
-		 * We use xtal / 3 as the default divider.
-		 */
 		baud_val = (bas->rclk / 3 + baudrate / 2) / baudrate - 1;
 		baud_val &= AML_UART_BAUD_MASK;
 		baud_val |= AML_UART_BAUD_USE | AML_UART_BAUD_XTAL;
@@ -245,6 +238,8 @@ meson_uart_getc(struct uart_bas *bas, struct mtx *hwmtx)
 struct meson_uart_softc {
 	struct uart_softc base;
 	struct callout    tx_callout;
+	clk_t             clk_pclk;
+	clk_t             clk_baud;
 };
 
 /*
@@ -345,22 +340,25 @@ meson_uart_bus_attach(struct uart_softc *sc)
 	callout_init(&msc->tx_callout, 1);	/* 1 = MP-safe */
 
 	/*
-	 * TODO: STUB -- relies on U-Boot clock configuration
+	 * Get and enable clocks from DTS.
+	 * DTS provides: "xtal", "pclk" (APB gate), "baud" (baud source).
+	 * If clock framework is not available (early boot), fall back
+	 * to the static rclk value (24 MHz) set in uart_meson_class.
 	 *
-	 * Current behavior:
-	 *   rclk is hardcoded to 24 MHz (the crystal oscillator frequency).
-	 *   This is correct for the baud rate divisor calculation on all
-	 *   known Meson GX/AXG/G12/SM1 SoCs.
-	 *
-	 * For a complete implementation:
-	 *   - Query the "baud" clock from the clock framework via
-	 *     clk_get_by_ofw_name(sc->sc_dev, 0, "baud", &clk)
-	 *   - Enable the "pclk" gate clock for APB register access
-	 *   - Use clk_get_freq() to get the actual clock rate
-	 *
-	 * Linux reference: drivers/tty/serial/meson_uart.c,
-	 *   meson_uart_probe() clock setup
+	 * Linux reference: meson_uart_probe_clocks() in meson_uart.c
 	 */
+	if (clk_get_by_ofw_name(sc->sc_dev, 0, "pclk",
+	    &msc->clk_pclk) == 0)
+		clk_enable(msc->clk_pclk);
+
+	if (clk_get_by_ofw_name(sc->sc_dev, 0, "baud",
+	    &msc->clk_baud) == 0) {
+		uint64_t freq;
+
+		clk_enable(msc->clk_baud);
+		if (clk_get_freq(msc->clk_baud, &freq) == 0 && freq > 0)
+			bas->rclk = (uint32_t)freq;
+	}
 
 	if (sc->sc_sysdev != NULL) {
 		di = sc->sc_sysdev;
@@ -397,6 +395,12 @@ meson_uart_bus_detach(struct uart_softc *sc)
 	val &= ~(AML_UART_RX_INT_EN | AML_UART_TX_INT_EN);
 	uart_setreg(bas, AML_UART_CONTROL, val);
 	uart_barrier(bas);
+
+	/* Release clocks. */
+	if (msc->clk_baud != NULL)
+		clk_release(msc->clk_baud);
+	if (msc->clk_pclk != NULL)
+		clk_release(msc->clk_pclk);
 
 	return (0);
 }
@@ -443,23 +447,25 @@ meson_uart_bus_ioctl(struct uart_softc *sc, int request, intptr_t data)
 	uart_lock(sc->sc_hwmtx);
 	switch (request) {
 	case UART_IOCTL_BAUD:
-		/*
-		 * TODO: STUB -- baud rate readback not implemented
-		 *
-		 * Current behavior:
-		 *   Returns EINVAL (unknown ioctl) since we do not
-		 *   read back the baud rate from hardware.
-		 *
-		 * For a complete implementation:
-		 *   - Read AML_UART_REG5 to extract the current divisor
-		 *   - Compute baud = rclk / (xtal_div * (divisor + 1))
-		 *   - Return the result in *data
-		 *
-		 * Linux reference: drivers/tty/serial/meson_uart.c,
-		 *   meson_uart_change_speed()
-		 */
-		error = EINVAL;
+	{
+		struct uart_bas *bas = &sc->sc_bas;
+		uint32_t val = uart_getreg(bas, AML_UART_REG5);
+
+		if (val & AML_UART_BAUD_USE) {
+			uint32_t divisor = (val & AML_UART_BAUD_MASK) + 1;
+
+			if (val & AML_UART_BAUD_XTAL) {
+				uint32_t xtal_div =
+				    (val & AML_UART_BAUD_XTAL_DIV2) ? 2 : 3;
+				*(int *)data = bas->rclk / xtal_div / divisor;
+			} else {
+				*(int *)data = bas->rclk / 4 / divisor;
+			}
+		} else {
+			error = ENXIO;
+		}
 		break;
+	}
 	default:
 		error = EINVAL;
 		break;
