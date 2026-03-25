@@ -39,14 +39,15 @@
  * The AO controller registers only fixed-rate clocks (gates not yet
  * implemented — the AO domain is always-on and U-Boot leaves gates open).
  *
- * TODO: STUB — PLLs and dividers rely on U-Boot initialization
+ * Implemented:
+ *   - EE: Fixed-rate (fixed_pll) and fixed-factor (fclk_div2..7, clk81)
+ *   - EE: Gate clocks (HHI_GCLK_MPEG0/1/2, SD_EMMC functional clocks)
+ *   - AO: Gate clocks (AO_RTI_GEN_CNTL_REG0) with direct resource access
+ *   - AO: Reset controller (bits 16-23 of AO_RTI_GEN_CNTL_REG0)
  *
- * For full implementation:
- *   - EE: PLL clocks (sys_pll, fixed_pll, gp0_pll, hdmi_pll)
- *   - EE: MPEG clock mux+divider (clk81) from HHI_MPEG_CLK_CNTL
- *   - EE: SD/eMMC mux+divider clocks for dynamic frequency
- *   - AO: Gate clocks via AO_RTI_GEN_CNTL_REG0
- *   - AO: Reset functionality (#reset-cells = <1>)
+ * Future work:
+ *   - sys_pll PLL clock with set_rate for cpufreq
+ *   - clk81 mux+divider hardware readback (HHI_MPEG_CLK_CNTL)
  *
  * Linux reference: drivers/clk/meson/gxbb.c (~92KB, 200+ clocks)
  * Linux reference: drivers/clk/meson/gxbb-aoclk.c (~8KB)
@@ -57,6 +58,7 @@
 #include <sys/bus.h>
 #include <sys/kernel.h>
 #include <sys/module.h>
+#include <sys/rman.h>
 #include <machine/bus.h>
 
 #include <dev/ofw/ofw_bus.h>
@@ -67,6 +69,9 @@
 
 #include <dev/clk/meson/meson_clk.h>
 
+#include <dev/hwreset/hwreset.h>
+
+#include "hwreset_if.h"
 #include "syscon_if.h"
 
 #include <dt-bindings/clock/gxbb-clkc.h>
@@ -93,24 +98,38 @@
  * ================================================================ */
 
 /*
- * Fixed-rate clocks: PLLs, dividers, and bus clocks.
+ * Clock tree: fixed_pll → fclk_div{2..7} → clk81 (→ peripheral gates).
  *
- * TODO: STUB — relies on U-Boot initialization
- *
- * For full implementation:
- *   - Read HHI_FIXED_PLL_CNTL (0x40) to get actual PLL config
- *   - Implement fclk_div2..7 as fixed-factor children of fixed_pll
- *   - Implement MPEG clock mux + divider (clk81) from HHI_MPEG_CLK_CNTL
- *   - Implement SD_EMMC_*_CLK0 as composite mux+divider clocks
+ * fixed_pll is configured by U-Boot to 2000 MHz and never changes.
+ * fclk_div{2..7} are fixed-factor dividers from fixed_pll.
+ * clk81 is actually a mux+divider (HHI_MPEG_CLK_CNTL), but U-Boot
+ * always selects fclk_div3/4 = 166.67 MHz.  Modeled as fixed-factor
+ * until hardware mux readback is implemented.
  */
+static const char *fclk_div_parent[] = { "fixed_pll" };
+static const char *clk81_parent[]    = { "fclk_div3" };
+
 static struct clk_fixed_def gxl_ee_fixed_clks[] = {
+	/*
+	 * fixed_pll: 2000 MHz — configured by U-Boot, never changed.
+	 * Parent is xtal (24 MHz) but the PLL multiplier is not modeled;
+	 * we report the output frequency directly.
+	 */
 	MESON_FIXED_RATE(CLKID_FIXED_PLL,  "fixed_pll",  2000000000),
-	MESON_FIXED_RATE(CLKID_FCLK_DIV2,  "fclk_div2",  1000000000),
-	MESON_FIXED_RATE(CLKID_FCLK_DIV3,  "fclk_div3",   666666666),
-	MESON_FIXED_RATE(CLKID_FCLK_DIV4,  "fclk_div4",   500000000),
-	MESON_FIXED_RATE(CLKID_FCLK_DIV5,  "fclk_div5",   400000000),
-	MESON_FIXED_RATE(CLKID_FCLK_DIV7,  "fclk_div7",   285714285),
-	MESON_FIXED_RATE(CLKID_CLK81,      "clk81",       166666666),
+
+	/* fclk_div: fixed-factor dividers from fixed_pll */
+	MESON_FIXED_FACTOR(CLKID_FCLK_DIV2, "fclk_div2", fclk_div_parent, 1, 2),
+	MESON_FIXED_FACTOR(CLKID_FCLK_DIV3, "fclk_div3", fclk_div_parent, 1, 3),
+	MESON_FIXED_FACTOR(CLKID_FCLK_DIV4, "fclk_div4", fclk_div_parent, 1, 4),
+	MESON_FIXED_FACTOR(CLKID_FCLK_DIV5, "fclk_div5", fclk_div_parent, 1, 5),
+	MESON_FIXED_FACTOR(CLKID_FCLK_DIV7, "fclk_div7", fclk_div_parent, 1, 7),
+
+	/*
+	 * clk81: MPEG bus clock, 166.67 MHz.
+	 * Actually a mux+divider (HHI_MPEG_CLK_CNTL), but U-Boot
+	 * always sets fclk_div3/4.  Modeled as fixed-factor for now.
+	 */
+	MESON_FIXED_FACTOR(CLKID_CLK81, "clk81", clk81_parent, 1, 4),
 };
 
 /*
@@ -195,19 +214,39 @@ static struct clk_gate_def gxl_ee_gate_clks[] = {
  * methods in the base class or directly in this driver.
  * ================================================================ */
 
-static struct clk_fixed_def gxl_ao_clks[] = {
-	/* AO UART gates — used by uart_AO_A / uart_AO_B */
-	MESON_FIXED_RATE(CLKID_AO_UART1,       "ao_uart1",       166666666),
-	MESON_FIXED_RATE(CLKID_AO_UART2,       "ao_uart2",       166666666),
+/*
+ * AO_RTI_GEN_CNTL_REG0 register layout:
+ *   Bits 0-6:  clock gate enables (1 = enabled)
+ *   Bits 16-23: reset control (0 = asserted, 1 = deasserted)
+ */
+#define	AO_RTI_GEN_CNTL_REG0	0x40
 
-	/* AO CLK81 — AO domain copy of the MPEG bus clock */
-	MESON_FIXED_RATE(CLKID_AO_CLK81,       "ao_clk81",       166666666),
+static struct clk_gate_def gxl_ao_gate_clks[] = {
+	MESON_CLK_GATE(CLKID_AO_REMOTE,      "ao_remote",      "clk81",
+	    AO_RTI_GEN_CNTL_REG0, 0),
+	MESON_CLK_GATE(CLKID_AO_I2C_MASTER,  "ao_i2c_master",  "clk81",
+	    AO_RTI_GEN_CNTL_REG0, 1),
+	MESON_CLK_GATE(CLKID_AO_I2C_SLAVE,   "ao_i2c_slave",   "clk81",
+	    AO_RTI_GEN_CNTL_REG0, 2),
+	MESON_CLK_GATE(CLKID_AO_UART1,       "ao_uart1",       "clk81",
+	    AO_RTI_GEN_CNTL_REG0, 3),
+	MESON_CLK_GATE(CLKID_AO_UART2,       "ao_uart2",       "clk81",
+	    AO_RTI_GEN_CNTL_REG0, 5),
+	MESON_CLK_GATE(CLKID_AO_IR_BLASTER,  "ao_ir_blaster",  "clk81",
+	    AO_RTI_GEN_CNTL_REG0, 6),
+};
 
-	/* Other AO domain gates */
-	MESON_FIXED_RATE(CLKID_AO_REMOTE,      "ao_remote",      166666666),
-	MESON_FIXED_RATE(CLKID_AO_I2C_MASTER,  "ao_i2c_master",  166666666),
-	MESON_FIXED_RATE(CLKID_AO_I2C_SLAVE,   "ao_i2c_slave",   166666666),
-	MESON_FIXED_RATE(CLKID_AO_IR_BLASTER,  "ao_ir_blaster",  166666666),
+/*
+ * AO resets — bits 16-23 of AO_RTI_GEN_CNTL_REG0.
+ * Reset is active-low: clear bit = assert, set bit = deassert.
+ */
+static const uint8_t gxl_ao_reset_bits[] = {
+	[0] = 16,	/* RESET_AO_REMOTE */
+	[1] = 17,	/* RESET_AO_UART1 */
+	[2] = 18,	/* RESET_AO_I2C_MASTER */
+	[3] = 19,	/* RESET_AO_I2C_SLAVE */
+	[4] = 22,	/* RESET_AO_UART2 */
+	[5] = 23,	/* RESET_AO_IR_BLASTER */
 };
 
 /* ================================================================
@@ -316,22 +355,89 @@ meson_gxl_aoclkc_probe(device_t dev)
 	return (ENXIO);
 
 match:
-	device_set_desc(dev, "Amlogic Meson GX AO Clock Controller (stub)");
+	device_set_desc(dev, "Amlogic Meson GX AO Clock Controller");
 	return (BUS_PROBE_DEFAULT);
 }
 
 static int
 meson_gxl_aoclkc_attach(device_t dev)
 {
+	struct meson_clk_softc *sc;
 
-	return (meson_clk_attach(dev, gxl_ao_clks, nitems(gxl_ao_clks),
-	    NULL, 0));
+	sc = device_get_softc(dev);
+
+	/*
+	 * AO clock controller lives inside a simple_mfd node.
+	 * Use parent's syscon for register access, same as EE clock.
+	 */
+	if (SYSCON_GET_HANDLE(dev, &sc->syscon) != 0) {
+		device_printf(dev, "cannot get syscon handle\n");
+		return (ENXIO);
+	}
+
+	/* Register as reset provider for AO domain resets. */
+	hwreset_register_ofw_provider(dev);
+
+	return (meson_clk_attach(dev, NULL, 0,
+	    gxl_ao_gate_clks, nitems(gxl_ao_gate_clks)));
+}
+
+/*
+ * AO reset controller — hwreset_if implementation.
+ *
+ * Resets are controlled by bits 16-23 of AO_RTI_GEN_CNTL_REG0.
+ * Active-low: clear bit = assert reset, set bit = deassert.
+ */
+static int
+meson_gxl_aoclkc_reset_assert(device_t dev, intptr_t id, bool assert)
+{
+	struct meson_clk_softc *sc;
+	uint32_t val, bit;
+
+	if (id < 0 || id >= (intptr_t)nitems(gxl_ao_reset_bits))
+		return (EINVAL);
+
+	sc = device_get_softc(dev);
+	bit = gxl_ao_reset_bits[id];
+
+	SYSCON_DEVICE_LOCK(device_get_parent(dev));
+	val = SYSCON_UNLOCKED_READ_4(sc->syscon, AO_RTI_GEN_CNTL_REG0);
+	if (assert)
+		val &= ~(1u << bit);
+	else
+		val |= (1u << bit);
+	SYSCON_UNLOCKED_WRITE_4(sc->syscon, AO_RTI_GEN_CNTL_REG0, val);
+	SYSCON_DEVICE_UNLOCK(device_get_parent(dev));
+
+	return (0);
+}
+
+static int
+meson_gxl_aoclkc_reset_is_asserted(device_t dev, intptr_t id, bool *asserted)
+{
+	struct meson_clk_softc *sc;
+	uint32_t val, bit;
+
+	if (id < 0 || id >= (intptr_t)nitems(gxl_ao_reset_bits))
+		return (EINVAL);
+
+	sc = device_get_softc(dev);
+	bit = gxl_ao_reset_bits[id];
+
+	val = SYSCON_UNLOCKED_READ_4(sc->syscon, AO_RTI_GEN_CNTL_REG0);
+	*asserted = !(val & (1u << bit));
+
+	return (0);
 }
 
 static device_method_t meson_gxl_aoclkc_methods[] = {
 	/* Device interface */
-	DEVMETHOD(device_probe,		meson_gxl_aoclkc_probe),
-	DEVMETHOD(device_attach,	meson_gxl_aoclkc_attach),
+	DEVMETHOD(device_probe,			meson_gxl_aoclkc_probe),
+	DEVMETHOD(device_attach,		meson_gxl_aoclkc_attach),
+
+	/* Reset interface */
+	DEVMETHOD(hwreset_assert,		meson_gxl_aoclkc_reset_assert),
+	DEVMETHOD(hwreset_is_asserted,		meson_gxl_aoclkc_reset_is_asserted),
 
 	DEVMETHOD_END
 };

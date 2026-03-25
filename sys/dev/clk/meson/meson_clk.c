@@ -38,13 +38,11 @@
  * on simple_mfd, e.g. the EE clock controller) or via a direct resource
  * (sc->res, for drivers that call bus_alloc_resource themselves).
  *
- * Currently supports fixed-rate and gate clocks.
+ * Currently supports fixed-rate, fixed-factor, and gate clocks.
  *
- * TODO:
- *   - Add support for mux, divider, and PLL clock types
- *   - Implement clk_set_rate()/clk_set_parent() for dynamic clocks
- *   - Add hwreset_if methods if the clock controller also provides
- *     reset functionality (as the AO clock controller does)
+ * Future work:
+ *   - Mux and divider clock types (for clk81 hardware readback)
+ *   - PLL clock type with set_rate (for cpufreq via sys_pll)
  *
  * Linux reference: drivers/clk/meson/ (gxbb.c, g12a.c, axg.c, etc.)
  * FreeBSD template: sys/dev/clk/allwinner/aw_ccung.c
